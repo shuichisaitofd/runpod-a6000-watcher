@@ -1,0 +1,37 @@
+name: A6000 sniper
+on:
+  workflow_dispatch:
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Watch
+        env:
+          KEY: ${{ secrets.RUNPOD_API_KEY }}
+          TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: |
+          if [ -z "$KEY" ] || [ -z "$TOPIC" ]; then
+            echo "Secrets RUNPOD_API_KEY / NTFY_TOPIC are not set"; exit 1
+          fi
+          curl -s -d "監視スタートしました" "https://ntfy.sh/$TOPIC" > /dev/null
+          for i in $(seq 1 1980); do
+            RES=$(curl -s https://api.runpod.io/graphql \
+              -H "Content-Type: application/json" \
+              -H "Authorization: Bearer $KEY" \
+              -d '{"query":"query { gpuTypes(input:{id:\"NVIDIA RTX A6000\"}) { lowestPrice(input:{gpuCount:1}) { stockStatus } } }"}')
+            if echo "$RES" | jq -e '.errors' > /dev/null 2>&1; then
+              echo "API error: $(echo "$RES" | jq -r '.errors[0].message')"
+              curl -s -d "RunPod APIエラーで監視停止。ログを確認してください" "https://ntfy.sh/$TOPIC" > /dev/null
+              exit 1
+            fi
+            STATUS=$(echo "$RES" | jq -r '.data.gpuTypes[0].lowestPrice.stockStatus // "None"')
+            echo "$(date +%T) $STATUS"
+            if [ "$STATUS" != "None" ]; then
+              curl -s -H "Priority: urgent" -H "Click: https://console.runpod.io/deploy" \
+                -d "RTX A6000 空きました！($STATUS) タップで開く" "https://ntfy.sh/$TOPIC" > /dev/null
+              exit 0
+            fi
+            sleep 10
+          done
+          curl -s -d "5時間経過、監視終了（空きなし）" "https://ntfy.sh/$TOPIC" > /dev/null
