@@ -1,0 +1,19 @@
+name: Notify test
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send test notification
+        env:
+          TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: |
+          echo "Topic length: ${#TOPIC}"
+          if echo "$TOPIC" | grep -q '[^A-Za-z0-9_-]'; then
+            echo "WARNING: topic contains characters other than A-Z a-z 0-9 - _ (full-width or space?)"
+          else
+            echo "Topic characters OK"
+          fi
+          curl -s -o /dev/null -w "ntfy HTTP status: %{http_code}\n" \
+            -H "Priority: urgent" -d "テスト通知です" "https://ntfy.sh/$TOPIC"
