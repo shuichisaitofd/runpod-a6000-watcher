@@ -1,6 +1,14 @@
 name: A6000 sniper
 on:
   workflow_dispatch:
+    inputs:
+      auto_deploy:
+        description: "空いたら自動でdeployする"
+        type: boolean
+        default: true
+concurrency:
+  group: a6000-sniper
+  cancel-in-progress: false
 jobs:
   watch:
     runs-on: ubuntu-latest
@@ -10,28 +18,73 @@ jobs:
         env:
           KEY: ${{ secrets.RUNPOD_API_KEY }}
           TOPIC: ${{ secrets.NTFY_TOPIC }}
+          AUTO_DEPLOY: ${{ inputs.auto_deploy }}
         run: |
           if [ -z "$KEY" ] || [ -z "$TOPIC" ]; then
             echo "Secrets RUNPOD_API_KEY / NTFY_TOPIC are not set"; exit 1
           fi
-          curl -s -d "監視スタートしました" "https://ntfy.sh/$TOPIC" > /dev/null
+          notify() { curl -s -H "Priority: ${2:-default}" -H "Click: ${3:-https://console.runpod.io/pods}" -d "$1" "https://ntfy.sh/$TOPIC" > /dev/null; }
+
+          BODY=$(jq -n '{
+            name: "h3-a6000-auto",
+            templateId: "p6lbkjsc9c",
+            imageName: "ghcr.io/shuichisaitofd/runpod-h3-mobile:h3-cu130-latest",
+            gpuTypeIds: ["NVIDIA RTX A6000"],
+            gpuCount: 1,
+            containerDiskInGb: 150,
+            volumeInGb: 100,
+            volumeMountPath: "/workspace",
+            allowedCudaVersions: ["13.0"]
+          }')
+
+          if [ "$AUTO_DEPLOY" = "true" ]; then
+            notify "監視スタート（自動deploy ON）"
+          else
+            notify "監視スタート（通知のみ）"
+          fi
+
+          FAIL_NOTIFIED=0
           for i in $(seq 1 1980); do
             RES=$(curl -s https://api.runpod.io/graphql \
               -H "Content-Type: application/json" \
               -H "Authorization: Bearer $KEY" \
-              -d '{"query":"query { gpuTypes(input:{id:\"NVIDIA RTX A6000\"}) { lowestPrice(input:{gpuCount:1}) { stockStatus } } }"}')
+              -d '{"query":"query { gpuTypes(input:{id:\"NVIDIA RTX A6000\"}) { lowestPrice(input:{gpuCount:1, secureCloud:true}) { stockStatus } } }"}')
             if echo "$RES" | jq -e '.errors' > /dev/null 2>&1; then
               echo "API error: $(echo "$RES" | jq -r '.errors[0].message')"
-              curl -s -d "RunPod APIエラーで監視停止。ログを確認してください" "https://ntfy.sh/$TOPIC" > /dev/null
+              notify "RunPod APIエラーで監視停止。ログを確認してください"
               exit 1
             fi
             STATUS=$(echo "$RES" | jq -r '.data.gpuTypes[0].lowestPrice.stockStatus // "None"')
-            echo "$(date +%T) $STATUS"
+            echo "$(date +%T) stock=$STATUS"
+
             if [ "$STATUS" != "None" ]; then
-              curl -s -H "Priority: urgent" -H "Click: https://console.runpod.io/deploy" \
-                -d "RTX A6000 空きました！($STATUS) タップで開く" "https://ntfy.sh/$TOPIC" > /dev/null
-              exit 0
+              if [ "$AUTO_DEPLOY" != "true" ]; then
+                notify "RTX A6000 空きました！($STATUS) タップで開く" urgent https://console.runpod.io/deploy
+                exit 0
+              fi
+
+              HTTP=$(curl -s -o resp.json -w "%{http_code}" -X POST https://rest.runpod.io/v1/pods \
+                -H "Content-Type: application/json" \
+                -H "Authorization: Bearer $KEY" \
+                -d "$BODY")
+              POD_ID=$(jq -r '.id // empty' resp.json 2>/dev/null)
+
+              if [ "${HTTP:0:1}" = "2" ] && [ -n "$POD_ID" ]; then
+                echo "DEPLOYED pod=$POD_ID"
+                notify "✅ RTX A6000 確保しました！課金中です。タップでPod一覧を開く" urgent https://console.runpod.io/pods
+                exit 0
+              fi
+
+              echo "Deploy failed (HTTP $HTTP): $(jq -c . resp.json 2>/dev/null | head -c 400)"
+              if [ "$HTTP" = "401" ] || [ "$HTTP" = "403" ]; then
+                notify "deploy権限エラー（APIキーがReadのみ？）監視停止"
+                exit 1
+              fi
+              if [ "$FAIL_NOTIFIED" = "0" ]; then
+                notify "空きを検知したけどdeploy失敗。監視を続けます"
+                FAIL_NOTIFIED=1
+              fi
             fi
             sleep 10
           done
-          curl -s -d "5時間経過、監視終了（空きなし）" "https://ntfy.sh/$TOPIC" > /dev/null
+          notify "5時間経過、監視終了（確保できず）"
