@@ -25,10 +25,10 @@ jobs:
           fi
           notify() { curl -s -H "Priority: ${2:-default}" -H "Click: ${3:-https://console.runpod.io/pods}" -d "$1" "https://ntfy.sh/$TOPIC" > /dev/null; }
 
+          # Template "H3 Mobile - veda test" (image comes from the template)
           BODY=$(jq -n '{
             name: "h3-veda-auto",
-            templateId: "p6lbkjsc9c",
-            imageName: "ghcr.io/shuichisaitofd/runpod-h3-mobile:h3-veda-test",
+            templateId: "8g2qn3j3o8",
             gpuTypeIds: ["NVIDIA RTX A6000"],
             gpuCount: 1,
             containerDiskInGb: 150,
@@ -70,7 +70,7 @@ jobs:
               POD_ID=$(jq -r '.id // empty' resp.json 2>/dev/null)
 
               if [ "${HTTP:0:1}" = "2" ] && [ -n "$POD_ID" ]; then
-                echo "DEPLOYED pod=$POD_ID"
+                echo "DEPLOYED pod=$POD_ID image=$(jq -r '.image // .imageName // "?"' resp.json)"
                 notify "[veda-test] ✅ RTX A6000 確保しました！課金中です。タップでPod一覧を開く" urgent https://console.runpod.io/pods
                 exit 0
               fi
