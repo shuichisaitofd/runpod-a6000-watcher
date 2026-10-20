@@ -1,0 +1,29 @@
+name: Diagnose A6000 availability (read-only)
+on:
+  workflow_dispatch:
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Query
+        env:
+          KEY: ${{ secrets.RUNPOD_API_KEY }}
+        run: |
+          set +e
+          q() {
+            echo "=== $1"
+            curl -s https://api.runpod.io/graphql \
+              -H "Content-Type: application/json" \
+              -H "Authorization: Bearer $KEY" \
+              -d "$(jq -n --arg q "$2" '{query:$q}')" | jq -c . | head -c 3000
+            echo
+          }
+          q "secure" 'query { gpuTypes(input:{id:"NVIDIA RTX A6000"}) { lowestPrice(input:{gpuCount:1, secureCloud:true}) { stockStatus uninterruptablePrice } } }'
+          q "community" 'query { gpuTypes(input:{id:"NVIDIA RTX A6000"}) { lowestPrice(input:{gpuCount:1, secureCloud:false}) { stockStatus uninterruptablePrice } } }'
+          q "secure minDisk250" 'query { gpuTypes(input:{id:"NVIDIA RTX A6000"}) { lowestPrice(input:{gpuCount:1, secureCloud:true, minDisk:250}) { stockStatus } } }'
+          q "secure cuda13" 'query { gpuTypes(input:{id:"NVIDIA RTX A6000"}) { lowestPrice(input:{gpuCount:1, secureCloud:true, cudaVersion:"13.0"}) { stockStatus } } }'
+          q "secure allowedCuda13" 'query { gpuTypes(input:{id:"NVIDIA RTX A6000"}) { lowestPrice(input:{gpuCount:1, secureCloud:true, allowedCudaVersions:["13.0"]}) { stockStatus } } }'
+          q "datacenters" 'query { dataCenters { id name gpuAvailability { gpuTypeId stockStatus } } }'
+          echo "=== my pods (REST)"
+          curl -s https://rest.runpod.io/v1/pods -H "Authorization: Bearer $KEY" | jq -c '[.[] | {name, desiredStatus, image, gpu: .machine.gpuTypeId}]' 2>/dev/null | head -c 2000
+          echo
