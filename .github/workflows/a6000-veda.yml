@@ -27,19 +27,23 @@ jobs:
           notify() { curl -s -H "Priority: ${2:-default}" -H "Click: ${3:-https://console.runpod.io/pods}" -d "$1" "https://ntfy.sh/$TOPIC" > /dev/null; }
 
           # Template "H3 Mobile - veda test" (image comes from the template)
-          BODY=$(jq -n '{
-            name: "h3-veda-auto",
-            templateId: "8g2qn3j3o8",
-            gpuTypeIds: ["NVIDIA RTX A6000"],
-            gpuCount: 1,
-            containerDiskInGb: 150,
-            volumeInGb: 100,
-            volumeMountPath: "/workspace",
-            allowedCudaVersions: ["13.0"]
-          }')
+          # CUDA versions match the template setting (13.0 - 13.4)
+          make_body() {
+            jq -n --argjson cuda "$1" '{
+              name: "h3-veda-auto",
+              templateId: "8g2qn3j3o8",
+              gpuTypeIds: ["NVIDIA RTX A6000"],
+              gpuCount: 1,
+              containerDiskInGb: 150,
+              volumeInGb: 100,
+              volumeMountPath: "/workspace",
+              allowedCudaVersions: $cuda
+            }'
+          }
+          BODY=$(make_body '["13.0","13.1","13.2","13.3","13.4"]')
+          FALLBACK_DONE=0
 
-          # Plain Secure-cloud stock check (same as the version that worked).
-          # The CUDA filter is applied by the deploy call itself.
+          # Plain Secure-cloud stock check (CUDA filter is applied by the deploy call itself)
           STOCK_Q='{"query":"query { gpuTypes(input:{id:\"NVIDIA RTX A6000\"}) { lowestPrice(input:{gpuCount:1, secureCloud:true}) { stockStatus } } }"}'
 
           if [ "$AUTO_DEPLOY" = "true" ]; then
@@ -56,7 +60,6 @@ jobs:
               -H "Authorization: Bearer $KEY" \
               -d "$STOCK_Q")
 
-            # Non-JSON / empty response (temporary API hiccup): skip and retry
             if ! echo "$RES" | jq -e . > /dev/null 2>&1; then
               BAD=$((BAD+1))
               echo "$(date +%T) API response not JSON (count=$BAD), retrying"
@@ -90,7 +93,7 @@ jobs:
             POD_ID=$(jq -r '.id // empty' resp.json 2>/dev/null)
 
             if [ "${HTTP:0:1}" = "2" ] && [ -n "$POD_ID" ]; then
-              echo "DEPLOYED pod=$POD_ID after $TRIES tries image=$(jq -r '.image // .imageName // \"?\"' resp.json 2>/dev/null)"
+              echo "DEPLOYED pod=$POD_ID after $TRIES tries"
               notify "[veda-test] ✅ RTX A6000 確保しました！課金中です。タップでPod一覧を開く" urgent https://console.runpod.io/pods
               exit 0
             fi
@@ -99,6 +102,13 @@ jobs:
             if [ "$HTTP" = "401" ] || [ "$HTTP" = "403" ]; then
               notify "[veda-test] deploy権限エラー。監視停止"
               exit 1
+            fi
+            # If the API rejects the newer CUDA versions, fall back to 13.0 only
+            if [ "$HTTP" = "400" ] && [ "$FALLBACK_DONE" = "0" ]; then
+              echo "API rejected CUDA list, falling back to 13.0 only"
+              BODY=$(make_body '["13.0"]')
+              FALLBACK_DONE=1
+              continue
             fi
             sleep 10
           done
