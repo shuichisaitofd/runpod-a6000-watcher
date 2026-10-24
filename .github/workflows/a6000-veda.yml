@@ -25,25 +25,16 @@ jobs:
             echo "Secrets RUNPOD_API_KEY / NTFY_TOPIC are not set"; exit 1
           fi
           notify() { curl -s -H "Priority: ${2:-default}" -H "Click: ${3:-https://console.runpod.io/pods}" -d "$1" "https://ntfy.sh/$TOPIC" > /dev/null; }
+          gql() { curl -s --max-time 30 https://api.runpod.io/graphql -H "Content-Type: application/json" -H "Authorization: Bearer $KEY" -d "$1"; }
 
-          # Template "H3 Mobile - veda test" (image comes from the template)
-          # CUDA versions match the template setting (13.0 - 13.4)
-          make_body() {
-            jq -n --argjson cuda "$1" '{
-              name: "h3-veda-auto",
-              templateId: "8g2qn3j3o8",
-              gpuTypeIds: ["NVIDIA RTX A6000"],
-              gpuCount: 1,
-              containerDiskInGb: 150,
-              volumeInGb: 100,
-              volumeMountPath: "/workspace",
-              allowedCudaVersions: $cuda
-            }'
-          }
-          BODY=$(make_body '["13.0","13.1","13.2","13.3","13.4"]')
-          FALLBACK_DONE=0
+          # Deploy via GraphQL with minCudaVersion 13.0 => accepts CUDA 13.0, 13.1, 13.2, 13.3, 13.4 ...
+          # (REST API only accepts exactly "13.0", which missed newer-driver machines)
+          DEPLOY_Q=$(jq -n --arg q 'mutation { podFindAndDeployOnDemand(input: { cloudType: SECURE, gpuCount: 1, gpuTypeId: "NVIDIA RTX A6000", name: "h3-veda-auto", templateId: "8g2qn3j3o8", imageName: "ghcr.io/shuichisaitofd/runpod-h3-mobile:h3-veda-test", containerDiskInGb: 150, volumeInGb: 100, volumeMountPath: "/workspace", minCudaVersion: "13.0" }) { id imageName machineId } }' '{query:$q}')
 
-          # Plain Secure-cloud stock check (CUDA filter is applied by the deploy call itself)
+          # Fallback (REST, CUDA 13.0 only) in case the GraphQL mutation is rejected by schema
+          REST_BODY=$(jq -n '{name:"h3-veda-auto", templateId:"8g2qn3j3o8", gpuTypeIds:["NVIDIA RTX A6000"], gpuCount:1, containerDiskInGb:150, volumeInGb:100, volumeMountPath:"/workspace", allowedCudaVersions:["13.0"]}')
+          USE_REST=0
+
           STOCK_Q='{"query":"query { gpuTypes(input:{id:\"NVIDIA RTX A6000\"}) { lowestPrice(input:{gpuCount:1, secureCloud:true}) { stockStatus } } }"}'
 
           if [ "$AUTO_DEPLOY" = "true" ]; then
@@ -52,32 +43,16 @@ jobs:
             notify "[veda-test] 監視スタート（通知のみ）"
           fi
 
-          BAD=0
           TRIES=0
           for i in $(seq 1 1980); do
-            RES=$(curl -s --max-time 20 https://api.runpod.io/graphql \
-              -H "Content-Type: application/json" \
-              -H "Authorization: Bearer $KEY" \
-              -d "$STOCK_Q")
-
+            RES=$(gql "$STOCK_Q")
             if ! echo "$RES" | jq -e . > /dev/null 2>&1; then
-              BAD=$((BAD+1))
-              echo "$(date +%T) API response not JSON (count=$BAD), retrying"
-              sleep 15
-              continue
-            fi
-            if echo "$RES" | jq -e '.errors' > /dev/null 2>&1; then
-              echo "$(date +%T) API error: $(echo "$RES" | jq -r '.errors[0].message' 2>/dev/null), retrying"
-              sleep 15
-              continue
+              echo "$(date +%T) stock API not JSON, retrying"; sleep 15; continue
             fi
             STATUS=$(echo "$RES" | jq -r '.data.gpuTypes[0].lowestPrice.stockStatus // "None"' 2>/dev/null)
             [ -z "$STATUS" ] && STATUS=None
-
             if [ "$STATUS" = "None" ]; then
-              echo "$(date +%T) stock=None"
-              sleep 10
-              continue
+              echo "$(date +%T) stock=None"; sleep 10; continue
             fi
 
             if [ "$AUTO_DEPLOY" != "true" ]; then
@@ -86,29 +61,34 @@ jobs:
             fi
 
             TRIES=$((TRIES+1))
-            HTTP=$(curl -s --max-time 30 -o resp.json -w "%{http_code}" -X POST https://rest.runpod.io/v1/pods \
-              -H "Content-Type: application/json" \
-              -H "Authorization: Bearer $KEY" \
-              -d "$BODY")
-            POD_ID=$(jq -r '.id // empty' resp.json 2>/dev/null)
-
-            if [ "${HTTP:0:1}" = "2" ] && [ -n "$POD_ID" ]; then
-              echo "DEPLOYED pod=$POD_ID after $TRIES tries"
-              notify "[veda-test] ✅ RTX A6000 確保しました！課金中です。タップでPod一覧を開く" urgent https://console.runpod.io/pods
-              exit 0
-            fi
-
-            echo "$(date +%T) stock=$STATUS deploy try $TRIES failed (HTTP $HTTP): $(head -c 200 resp.json 2>/dev/null)"
-            if [ "$HTTP" = "401" ] || [ "$HTTP" = "403" ]; then
-              notify "[veda-test] deploy権限エラー。監視停止"
-              exit 1
-            fi
-            # If the API rejects the newer CUDA versions, fall back to 13.0 only
-            if [ "$HTTP" = "400" ] && [ "$FALLBACK_DONE" = "0" ]; then
-              echo "API rejected CUDA list, falling back to 13.0 only"
-              BODY=$(make_body '["13.0"]')
-              FALLBACK_DONE=1
-              continue
+            if [ "$USE_REST" = "0" ]; then
+              DR=$(gql "$DEPLOY_Q")
+              POD_ID=$(echo "$DR" | jq -r '.data.podFindAndDeployOnDemand.id // empty' 2>/dev/null)
+              if [ -n "$POD_ID" ]; then
+                echo "DEPLOYED(graphql) pod=$POD_ID image=$(echo "$DR" | jq -r '.data.podFindAndDeployOnDemand.imageName' 2>/dev/null) after $TRIES tries"
+                notify "[veda-test] ✅ RTX A6000 確保しました！課金中です。タップでPod一覧を開く" urgent https://console.runpod.io/pods
+                exit 0
+              fi
+              MSG=$(echo "$DR" | jq -r '.errors[0].message // "no message"' 2>/dev/null)
+              echo "$(date +%T) stock=$STATUS deploy try $TRIES failed (graphql): $(echo "$MSG" | head -c 200)"
+              if echo "$MSG" | grep -qiE 'unknown argument|cannot query|not defined|expected type|syntax|validation'; then
+                echo "GraphQL schema rejected the mutation -> fallback to REST (CUDA 13.0 only)"
+                notify "[veda-test] 新方式のdeployが使えず、13.0のみで継続します"
+                USE_REST=1
+                continue
+              fi
+              if echo "$MSG" | grep -qiE 'unauthor|permission|forbidden'; then
+                notify "[veda-test] deploy権限エラー。監視停止"; exit 1
+              fi
+            else
+              HTTP=$(curl -s --max-time 30 -o resp.json -w "%{http_code}" -X POST https://rest.runpod.io/v1/pods -H "Content-Type: application/json" -H "Authorization: Bearer $KEY" -d "$REST_BODY")
+              POD_ID=$(jq -r '.id // empty' resp.json 2>/dev/null)
+              if [ "${HTTP:0:1}" = "2" ] && [ -n "$POD_ID" ]; then
+                echo "DEPLOYED(rest) pod=$POD_ID after $TRIES tries"
+                notify "[veda-test] ✅ RTX A6000 確保しました！課金中です。タップでPod一覧を開く" urgent https://console.runpod.io/pods
+                exit 0
+              fi
+              echo "$(date +%T) stock=$STATUS deploy try $TRIES failed (rest HTTP $HTTP): $(head -c 200 resp.json 2>/dev/null)"
             fi
             sleep 10
           done
