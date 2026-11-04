@@ -19,28 +19,34 @@ jobs:
           KEY: ${{ secrets.RUNPOD_API_KEY }}
           TOPIC: ${{ secrets.NTFY_TOPIC }}
           AUTO_DEPLOY: ${{ inputs.auto_deploy }}
+          TEMPLATE_ID: rp0bq9dcco   # H3 Mobile - veda 10max long
+          POD_NAME: h3-veda-10max-long
+          TAG: "[veda-10max-long]"
         run: |
           set +e
           if [ -z "$KEY" ] || [ -z "$TOPIC" ]; then
             echo "Secrets RUNPOD_API_KEY / NTFY_TOPIC are not set"; exit 1
           fi
-          notify() { curl -s -H "Priority: ${2:-default}" -H "Click: ${3:-https://console.runpod.io/pods}" -d "$1" "https://ntfy.sh/$TOPIC" > /dev/null; }
+          notify() { curl -s -H "Priority: ${2:-default}" -H "Click: ${3:-https://console.runpod.io/pods}" -d "$TAG $1" "https://ntfy.sh/$TOPIC" > /dev/null; }
           gql() { curl -s --max-time 30 https://api.runpod.io/graphql -H "Content-Type: application/json" -H "Authorization: Bearer $KEY" -d "$1"; }
 
-          # Template "H3 Mobile - veda 10max long" (rp0bq9dcco)
-          # Deploy via GraphQL with minCudaVersion 13.0 => accepts CUDA 13.0 and newer
-          DEPLOY_Q=$(jq -n --arg q 'mutation { podFindAndDeployOnDemand(input: { cloudType: SECURE, gpuCount: 1, gpuTypeId: "NVIDIA RTX A6000", name: "h3-veda-10max-long", templateId: "rp0bq9dcco", imageName: "ghcr.io/shuichisaitofd/runpod-h3-mobile:h3-longtest-842b097a7c77f2e1d18cf4f0d5df3343edd8873e", containerDiskInGb: 150, volumeInGb: 100, volumeMountPath: "/workspace", minCudaVersion: "13.0" }) { id imageName machineId } }' '{query:$q}')
-
-          # Fallback (REST, CUDA 13.0 only) in case the GraphQL mutation is rejected by schema
-          REST_BODY=$(jq -n '{name:"h3-veda-10max-long", templateId:"rp0bq9dcco", gpuTypeIds:["NVIDIA RTX A6000"], gpuCount:1, containerDiskInGb:150, volumeInGb:100, volumeMountPath:"/workspace", allowedCudaVersions:["13.0"]}')
-          USE_REST=0
+          # Always use the template's CURRENT image (no hardcoded tag)
+          template_image() {
+            gql '{"query":"query { myself { podTemplates { id imageName } } }"}' \
+              | jq -r --arg id "$TEMPLATE_ID" '.data.myself.podTemplates[]? | select(.id==$id) | .imageName' 2>/dev/null | head -n1
+          }
+          IMG=$(template_image)
+          if [ -z "$IMG" ]; then
+            notify "テンプレートのイメージが取得できず監視停止"; exit 1
+          fi
+          echo "Template image: $IMG"
 
           STOCK_Q='{"query":"query { gpuTypes(input:{id:\"NVIDIA RTX A6000\"}) { lowestPrice(input:{gpuCount:1, secureCloud:true}) { stockStatus } } }"}'
 
           if [ "$AUTO_DEPLOY" = "true" ]; then
-            notify "[veda-10max-long] 監視スタート（自動deploy ON）"
+            notify "監視スタート（自動deploy ON）"
           else
-            notify "[veda-10max-long] 監視スタート（通知のみ）"
+            notify "監視スタート（通知のみ）"
           fi
 
           TRIES=0
@@ -56,40 +62,31 @@ jobs:
             fi
 
             if [ "$AUTO_DEPLOY" != "true" ]; then
-              notify "[veda-10max-long] RTX A6000 空きました！($STATUS) タップで開く" urgent https://console.runpod.io/deploy
+              notify "RTX A6000 空きました！($STATUS) タップで開く" urgent https://console.runpod.io/deploy
               exit 0
             fi
 
+            # Re-read the template image right before deploying (picks up tag updates mid-run)
+            NEW_IMG=$(template_image); [ -n "$NEW_IMG" ] && IMG="$NEW_IMG"
+
             TRIES=$((TRIES+1))
-            if [ "$USE_REST" = "0" ]; then
-              DR=$(gql "$DEPLOY_Q")
-              POD_ID=$(echo "$DR" | jq -r '.data.podFindAndDeployOnDemand.id // empty' 2>/dev/null)
-              if [ -n "$POD_ID" ]; then
-                echo "DEPLOYED(graphql) pod=$POD_ID image=$(echo "$DR" | jq -r '.data.podFindAndDeployOnDemand.imageName' 2>/dev/null) after $TRIES tries"
-                notify "[veda-10max-long] ✅ RTX A6000 確保しました！課金中です。タップでPod一覧を開く" urgent https://console.runpod.io/pods
-                exit 0
-              fi
-              MSG=$(echo "$DR" | jq -r '.errors[0].message // "no message"' 2>/dev/null)
-              echo "$(date +%T) stock=$STATUS deploy try $TRIES failed (graphql): $(echo "$MSG" | head -c 200)"
-              if echo "$MSG" | grep -qiE 'unknown argument|cannot query|not defined|expected type|syntax|validation'; then
-                echo "GraphQL schema rejected the mutation -> fallback to REST (CUDA 13.0 only)"
-                notify "[veda-10max-long] 新方式のdeployが使えず、13.0のみで継続します"
-                USE_REST=1
-                continue
-              fi
-              if echo "$MSG" | grep -qiE 'unauthor|permission|forbidden'; then
-                notify "[veda-10max-long] deploy権限エラー。監視停止"; exit 1
-              fi
-            else
-              HTTP=$(curl -s --max-time 30 -o resp.json -w "%{http_code}" -X POST https://rest.runpod.io/v1/pods -H "Content-Type: application/json" -H "Authorization: Bearer $KEY" -d "$REST_BODY")
-              POD_ID=$(jq -r '.id // empty' resp.json 2>/dev/null)
-              if [ "${HTTP:0:1}" = "2" ] && [ -n "$POD_ID" ]; then
-                echo "DEPLOYED(rest) pod=$POD_ID after $TRIES tries"
-                notify "[veda-10max-long] ✅ RTX A6000 確保しました！課金中です。タップでPod一覧を開く" urgent https://console.runpod.io/pods
-                exit 0
-              fi
-              echo "$(date +%T) stock=$STATUS deploy try $TRIES failed (rest HTTP $HTTP): $(head -c 200 resp.json 2>/dev/null)"
+            DEPLOY_Q=$(jq -n --arg tid "$TEMPLATE_ID" --arg name "$POD_NAME" --arg img "$IMG" \
+              '{query: ("mutation { podFindAndDeployOnDemand(input: { cloudType: SECURE, gpuCount: 1, gpuTypeId: \"NVIDIA RTX A6000\", name: \"" + $name + "\", templateId: \"" + $tid + "\", imageName: \"" + $img + "\", containerDiskInGb: 150, volumeInGb: 100, volumeMountPath: \"/workspace\", minCudaVersion: \"13.0\" }) { id imageName machineId } }")}')
+            DR=$(gql "$DEPLOY_Q")
+            POD_ID=$(echo "$DR" | jq -r '.data.podFindAndDeployOnDemand.id // empty' 2>/dev/null)
+            if [ -n "$POD_ID" ]; then
+              echo "DEPLOYED pod=$POD_ID image=$(echo "$DR" | jq -r '.data.podFindAndDeployOnDemand.imageName' 2>/dev/null) after $TRIES tries"
+              notify "✅ RTX A6000 確保しました！課金中です。タップでPod一覧を開く" urgent https://console.runpod.io/pods
+              exit 0
+            fi
+            MSG=$(echo "$DR" | jq -r '.errors[0].message // "no message"' 2>/dev/null)
+            echo "$(date +%T) stock=$STATUS deploy try $TRIES failed: $(echo "$MSG" | head -c 200)"
+            if echo "$MSG" | grep -qiE 'unauthor|permission|forbidden'; then
+              notify "deploy権限エラー。監視停止"; exit 1
+            fi
+            if echo "$MSG" | grep -qiE 'unknown argument|cannot query|not defined|expected type|syntax'; then
+              notify "deployの命令が拒否されたため監視停止。ログを確認してください"; exit 1
             fi
             sleep 10
           done
-          notify "[veda-10max-long] 5時間経過、監視終了（確保できず）"
+          notify "5時間経過、監視終了（確保できず）"
